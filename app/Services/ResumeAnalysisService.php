@@ -118,7 +118,12 @@ PROMPT;
     /**
      * PDF (on cloud disk) -> text using docker compose + pdftotext
      */
-    private function extractTextFromPdf(string $cloudPath): string
+    /**
+ * PDF (on cloud disk) -> text
+ * Local dev: docker-compose pdf service
+ * Production (Laravel Cloud): native pdftotext
+ */
+private function extractTextFromPdf(string $cloudPath): string
 {
     // 1) Check file exists on cloud disk
     if (!Storage::disk('cloud')->exists($cloudPath)) {
@@ -135,18 +140,56 @@ PROMPT;
         @mkdir($tmpDir, 0775, true);
     }
 
-    $tmpName = 'resume_' . Str::random(10) . '.pdf';
+    $tmpName   = 'resume_' . Str::random(10) . '.pdf';
     $localPath = $tmpDir . DIRECTORY_SEPARATOR . $tmpName;
 
     try {
         file_put_contents($localPath, $pdfBytes);
 
-        // 4) Prepare docker-compose command
-        // Docker mounts on Windows need forward slashes
+        // ✅ PRODUCTION (Laravel Cloud): run native pdftotext
+        if (app()->environment('production')) {
+            $cmd = [
+                'pdftotext',
+                '-layout',
+                '-nopgbrk',
+                $localPath,
+                '-', // stdout
+            ];
+
+            logger()->info('Running pdftotext (native)', [
+                'cmd' => $cmd,
+                'localPath' => $localPath,
+            ]);
+
+            $process = new Process($cmd);
+            $process->setTimeout(60);
+            $process->run();
+
+            $output = (string) $process->getOutput();
+            $error  = (string) $process->getErrorOutput();
+
+            logger()->info('pdftotext extracted text preview (native)', [
+                'success' => $process->isSuccessful(),
+                'len' => strlen($output),
+                'preview' => substr($output, 0, 500),
+                'stderr_preview' => substr($error, 0, 300),
+            ]);
+
+            if (!$process->isSuccessful()) {
+                logger()->error('pdftotext failed (native)', [
+                    'error' => $error,
+                    'output' => $output,
+                ]);
+                return '';
+            }
+
+            return $output;
+        }
+
+        // ✅ LOCAL DEV (Windows): docker-compose pdf service
         $dir  = str_replace('\\', '/', dirname($localPath));
         $file = basename($localPath);
 
-        // ✅ docker-compose.exe path (confirmed by `where.exe docker-compose`)
         $dockerCompose = str_replace('\\', '/', $this->dockerComposeBin);
 
         $cmd = [
@@ -164,7 +207,6 @@ PROMPT;
             'compose_dir' => $this->pdfComposeDir,
         ]);
 
-        // 5) Run
         $process = new Process($cmd, $this->pdfComposeDir);
         $process->setTimeout(180);
         $process->run();
@@ -172,7 +214,7 @@ PROMPT;
         $output = (string) $process->getOutput();
         $error  = (string) $process->getErrorOutput();
 
-        logger()->info('pdftotext extracted text preview', [
+        logger()->info('pdftotext extracted text preview (docker-compose)', [
             'success' => $process->isSuccessful(),
             'len' => strlen($output),
             'preview' => substr($output, 0, 500),
@@ -180,7 +222,7 @@ PROMPT;
         ]);
 
         if (!$process->isSuccessful()) {
-            logger()->error('pdftotext failed', [
+            logger()->error('pdftotext failed (docker-compose)', [
                 'error' => $error,
                 'output' => $output,
             ]);
@@ -188,8 +230,13 @@ PROMPT;
         }
 
         return $output;
+
+    } catch (\Throwable $e) {
+        logger()->error('extractTextFromPdf crashed', [
+            'message' => $e->getMessage(),
+        ]);
+        return '';
     } finally {
-        // 6) Always clean temp file
         if (file_exists($localPath)) {
             @unlink($localPath);
         }
